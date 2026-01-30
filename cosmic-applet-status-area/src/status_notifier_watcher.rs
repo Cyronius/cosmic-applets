@@ -27,6 +27,15 @@ pub fn run() -> cosmic::iced::Result {
 pub async fn cosmic_register(conn: &zbus::Connection) -> zbus::Result<()> {
     let cosmic_watcher = CosmicAppletStatusNotifierWatcherProxy::new(conn).await?;
     cosmic_watcher.register_applet().await?;
+    let mut stream = cosmic_watcher.0.receive_owner_changed().await?;
+    tokio::spawn(async move {
+        while let Some(value) = stream.next().await {
+            if let Some(_unique_name) = value {
+                /// Register with new owner
+                let _ = cosmic_watcher.register_applet().await;
+            }
+        }
+    });
     Ok(())
 }
 
