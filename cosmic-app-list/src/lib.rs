@@ -6,6 +6,9 @@ mod localize;
 mod wayland_handler;
 mod wayland_subscription;
 
+#[cfg(test)]
+mod tests;
+
 use localize::localize;
 
 pub fn run() -> cosmic::iced::Result {

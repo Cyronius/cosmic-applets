@@ -4,6 +4,12 @@
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> cosmic::iced::Result {
+    // Install panic hook for better crash diagnostics
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("PANIC: {:?}", info);
+        eprintln!("Backtrace: {:?}", std::backtrace::Backtrace::capture());
+    }));
+
     tracing_subscriber::fmt::init();
     let _ = tracing_log::LogTracer::init();
 

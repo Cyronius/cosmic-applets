@@ -61,6 +61,22 @@ use url::Url;
 
 static MIME_TYPE: &str = "text/uri-list";
 
+/// Maximum width multiplier for ungrouped window buttons relative to normal icon size
+const UNGROUPED_BUTTON_MAX_WIDTH_MULTIPLIER: f32 = 2.5;
+
+/// Maximum characters for ungrouped window titles (truncated with ellipsis)
+const UNGROUPED_TITLE_MAX_CHARS: usize = 20;
+
+/// Truncate a title to max_chars, adding ellipsis if truncated
+fn truncate_title(title: &str, max_chars: usize) -> String {
+    if title.chars().count() <= max_chars {
+        title.to_owned()
+    } else {
+        let truncated: String = title.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{}…", truncated)
+    }
+}
+
 pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<CosmicAppList>(())
 }
@@ -142,6 +158,10 @@ impl AppletIconData {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DockItemId {
     Item(u32),
+    /// Ungrouped window: (dock_item_id, toplevel_index)
+    /// Different from Item to prevent widget tree mismatch when switching between
+    /// launcher icon and window buttons
+    UngroupedWindow(u32, usize),
     ActiveOverflow,
     FavoritesOverflow,
 }
@@ -321,6 +341,144 @@ impl DockItem {
             icon_button.into()
         }
     }
+
+    /// Render a single window for ungrouped mode with visible title label
+    fn as_ungrouped_window(
+        &self,
+        applet: &Context,
+        rectangle_tracker: Option<&RectangleTracker<DockItemId>>,
+        toplevel_idx: usize,
+        is_focused: bool,
+        dot_border_radius: [f32; 4],
+        window_id: window::Id,
+    ) -> Element<'_, Message> {
+        let Self {
+            toplevels,
+            desktop_info,
+            id,
+            ..
+        } = self;
+
+        let Some((toplevel_info, _image)) = toplevels.get(toplevel_idx) else {
+            return vertical_space().height(0).into();
+        };
+
+        let app_icon = AppletIconData::new(applet);
+
+        // Calculate max button width (2.5x normal icon button)
+        let normal_button_width =
+            app_icon.icon_size as f32 + app_icon.padding.left + app_icon.padding.right;
+        let _max_button_width = normal_button_width * UNGROUPED_BUTTON_MAX_WIDTH_MULTIPLIER;
+
+        let cosmic_icon = cosmic::widget::icon(
+            fde::IconSource::from_unknown(desktop_info.icon().unwrap_or_default()).as_cosmic_icon(),
+        )
+        .size(128)
+        .width(app_icon.icon_size.into())
+        .height(app_icon.icon_size.into());
+
+        // Single window indicator (always present since we have a toplevel)
+        let indicator = vertical_space()
+            .height(Length::Fixed(0.0))
+            .apply(container)
+            .padding(app_icon.dot_radius)
+            .class(theme::Container::custom(move |theme| container::Style {
+                background: if is_focused {
+                    Some(Background::Color(theme.cosmic().accent_color().into()))
+                } else {
+                    Some(Background::Color(theme.cosmic().on_bg_color().into()))
+                },
+                border: Border {
+                    radius: dot_border_radius.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+
+        // Truncate title (tooltip shows full title on hover)
+        let display_title = truncate_title(&toplevel_info.title, UNGROUPED_TITLE_MAX_CHARS);
+
+        let title_label = text(display_title)
+            .size(10)
+            .width(Length::Shrink)
+            .class(theme::Text::Custom(|theme| cosmic::iced::widget::text::Style {
+                color: Some(theme.cosmic().on_bg_color().into()),
+            }));
+
+        // Layout based on panel orientation
+        let icon_with_indicator: Element<_> = match applet.anchor {
+            PanelAnchor::Left => row([
+                indicator.into(),
+                horizontal_space().width(Length::Fixed(1.0)).into(),
+                cosmic_icon.into(),
+            ])
+            .align_y(Alignment::Center)
+            .into(),
+            PanelAnchor::Right => row([
+                cosmic_icon.into(),
+                horizontal_space().width(Length::Fixed(1.0)).into(),
+                indicator.into(),
+            ])
+            .align_y(Alignment::Center)
+            .into(),
+            PanelAnchor::Top => column([
+                indicator.into(),
+                vertical_space().height(Length::Fixed(1.0)).into(),
+                cosmic_icon.into(),
+            ])
+            .align_x(Alignment::Center)
+            .into(),
+            PanelAnchor::Bottom => column([
+                cosmic_icon.into(),
+                vertical_space().height(Length::Fixed(1.0)).into(),
+                indicator.into(),
+            ])
+            .align_x(Alignment::Center)
+            .into(),
+        };
+
+        // Add title label based on orientation
+        let content: Element<_> = match applet.anchor {
+            PanelAnchor::Top | PanelAnchor::Bottom => {
+                column([icon_with_indicator, title_label.into()])
+                    .spacing(2)
+                    .align_x(Alignment::Center)
+                    .into()
+            }
+            PanelAnchor::Left | PanelAnchor::Right => {
+                row([icon_with_indicator, title_label.into()])
+                    .spacing(4)
+                    .align_y(Alignment::Center)
+                    .into()
+            }
+        };
+
+        let icon_button = button::custom(content)
+            .padding(app_icon.padding)
+            .selected(is_focused)
+            .class(ungrouped_window_style(is_focused))
+            .on_press(Message::Toggle(toplevel_info.foreign_toplevel.clone()))
+            .width(Length::Shrink)
+            .height(Length::Shrink);
+
+        let button_with_mouse = mouse_area(icon_button)
+            .on_right_release(Message::Popup(*id, window_id));
+
+        // Wrap in dnd_source (disabled) to match the widget tree structure of as_icon()
+        // This prevents widget tree mismatch crashes when switching between launcher icons
+        // and window buttons for the same pinned app
+        let wrapped: Element<_> = dnd_source::<Message, DndPathBuf>(button_with_mouse).into();
+
+        if let Some(tracker) = rectangle_tracker {
+            // Use UngroupedWindow ID to distinguish from launcher icons and prevent
+            // widget tree mismatch when switching between them
+            tracker
+                .container(DockItemId::UngroupedWindow(*id, toplevel_idx), wrapped)
+                .into()
+        } else {
+            wrapped
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -396,7 +554,9 @@ enum Message {
     DndMotion(f64, f64),
     DndDropFinished,
     DndData(Option<DndPathBuf>),
+    #[allow(dead_code)]
     StartListeningForDnd,
+    #[allow(dead_code)]
     StopListeningForDnd,
     IncrementSubscriptionCtr,
     ConfigUpdated(AppListConfig),
@@ -609,6 +769,52 @@ fn app_list_icon_style(selected: bool) -> cosmic::theme::Button {
     }
 }
 
+/// Style for ungrouped window buttons - squarish with rounded corners
+fn ungrouped_window_style(selected: bool) -> cosmic::theme::Button {
+    Button::Custom {
+        active: Box::new(move |focused, theme| {
+            let base = button::Catalog::active(theme, focused, selected, &Button::AppletIcon);
+            // Use a smaller, more squarish corner radius
+            let radius = theme.cosmic().radius_s();
+            button::Style {
+                background: if selected {
+                    Some(Background::Color(
+                        theme.cosmic().icon_button.selected_state_color().into(),
+                    ))
+                } else {
+                    base.background
+                },
+                border_radius: radius.into(),
+                ..base
+            }
+        }),
+        hovered: Box::new(move |focused, theme| {
+            let base = button::Catalog::hovered(theme, focused, selected, &Button::AppletIcon);
+            let radius = theme.cosmic().radius_s();
+            button::Style {
+                border_radius: radius.into(),
+                ..base
+            }
+        }),
+        disabled: Box::new(|theme| {
+            let base = button::Catalog::disabled(theme, &Button::AppletIcon);
+            let radius = theme.cosmic().radius_s();
+            button::Style {
+                border_radius: radius.into(),
+                ..base
+            }
+        }),
+        pressed: Box::new(move |focused, theme| {
+            let base = button::Catalog::pressed(theme, focused, selected, &Button::AppletIcon);
+            let radius = theme.cosmic().radius_s();
+            button::Style {
+                border_radius: radius.into(),
+                ..base
+            }
+        }),
+    }
+}
+
 #[inline]
 pub fn menu_control_padding() -> Padding {
     let spacing = theme::spacing();
@@ -638,6 +844,10 @@ impl CosmicAppList {
 
     // Update pinned items using the cached desktop entries as a source.
     fn update_pinned_list(&mut self) {
+        tracing::debug!(
+            "update_pinned_list: config.favorites = {:?}",
+            self.config.favorites
+        );
         self.pinned_list = find_desktop_entries(&self.desktop_entries, &self.config.favorites)
             .zip(&self.config.favorites)
             .enumerate()
@@ -648,6 +858,19 @@ impl CosmicAppList {
                 original_app_id: original_id.clone(),
             })
             .collect();
+        tracing::debug!(
+            "update_pinned_list: pinned_list.len() = {}",
+            self.pinned_list.len()
+        );
+        // Log each pinned item for debugging
+        for item in &self.pinned_list {
+            tracing::debug!(
+                "  pinned_item: original_id={}, desktop_id={}, icon={:?}",
+                item.original_app_id,
+                item.desktop_info.id(),
+                item.desktop_info.icon()
+            );
+        }
     }
 
     /// Close any open popups.
@@ -688,18 +911,15 @@ impl CosmicAppList {
             + self.core.applet.suggested_padding(true).0 * 2
             + applet_icon.icon_spacing as u16;
 
-        let favorite_active_cnt = self
-            .pinned_list
-            .iter()
-            .filter(|t| !t.toplevels.is_empty())
-            .count();
+        // Count ALL pinned apps - they should all be visible as launchers
+        let favorite_cnt = self.pinned_list.len();
 
         // initial calculation of favorite_index
         let btn_count = max_major_axis_len / button_total_size as u32;
         if btn_count >= self.pinned_list.len() as u32 + self.active_list.len() as u32 {
             return (None, active_index);
         } else {
-            favorite_index = (btn_count as usize).min(favorite_active_cnt).max(2);
+            favorite_index = (btn_count as usize).min(favorite_cnt).max(2);
         }
 
         // calculation of active_index based on favorite_index if there is still not enough space
@@ -726,7 +946,7 @@ impl CosmicAppList {
         if self.active_workspaces.is_empty() {
             return Vec::new();
         }
-        let current_output = &self.core.applet.output_name;
+        let _current_output = &self.core.applet.output_name;
         let mut focused_toplevels: Vec<ExtForeignToplevelHandleV1> = Vec::new();
         let active_workspaces = &self.active_workspaces;
         for toplevel_list in self.active_list.iter().chain(self.pinned_list.iter()) {
@@ -735,17 +955,37 @@ impl CosmicAppList {
                     && active_workspaces
                         .iter()
                         .any(|workspace| t_info.workspace.contains(workspace))
-                    && t_info.output.iter().any(|x| {
-                        self.output_list.get(x).is_some_and(|val| {
-                            val.name.as_ref().is_some_and(|n| n == current_output)
-                        })
-                    })
+                    && self.toplevel_on_current_output(t_info)
                 {
                     focused_toplevels.push(t_info.foreign_toplevel.clone());
                 }
             }
         }
         focused_toplevels
+    }
+
+    /// Check if a toplevel window is on the current output (monitor).
+    /// Used for filtering windows in ungrouped mode to only show windows on this panel's monitor.
+    fn toplevel_on_current_output(&self, info: &ToplevelInfo) -> bool {
+        let current_output = &self.core.applet.output_name;
+        let window_outputs: Vec<_> = info
+            .output
+            .iter()
+            .filter_map(|o| self.output_list.get(o).and_then(|i| i.name.clone()))
+            .collect();
+        let result = info.output.iter().any(|output| {
+            self.output_list
+                .get(output)
+                .is_some_and(|val| val.name.as_ref().is_some_and(|n| n == current_output))
+        });
+        tracing::debug!(
+            "toplevel_on_current_output: app={}, current_output={}, window_outputs={:?}, result={}",
+            info.app_id,
+            current_output,
+            window_outputs,
+            result
+        );
+        result
     }
 
     fn find_desktop_entry_for_toplevel(
@@ -810,10 +1050,54 @@ impl cosmic::Application for CosmicAppList {
     const APP_ID: &'static str = APP_ID;
 
     fn init(core: cosmic::app::Core, _flags: Self::Flags) -> (Self, app::Task<Self::Message>) {
-        let config = Config::new(APP_ID, AppListConfig::VERSION)
-            .ok()
-            .and_then(|c| AppListConfig::get_entry(&c).ok())
+        let config_handler = Config::new(APP_ID, AppListConfig::VERSION).ok();
+        let mut config = config_handler
+            .as_ref()
+            .and_then(|c| AppListConfig::get_entry(c).ok())
             .unwrap_or_default();
+
+        // Migrate favorites from v1 to v2 if v2 favorites are empty
+        if config.favorites.is_empty() {
+            // Try to read v1 favorites file directly from filesystem
+            if let Some(config_dir) = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            {
+                let v1_path = config_dir
+                    .join("cosmic")
+                    .join(APP_ID)
+                    .join("v1")
+                    .join("favorites");
+                if let Ok(contents) = std::fs::read_to_string(&v1_path) {
+                    // Parse RON-format array: ["item1", "item2", ...]
+                    let v1_favorites: Vec<String> = contents
+                        .lines()
+                        .filter_map(|line| {
+                            let trimmed = line.trim();
+                            if trimmed.starts_with('"') && trimmed.ends_with('"') {
+                                Some(trimmed.trim_matches('"').trim_end_matches(',').to_string())
+                            } else if trimmed.starts_with('"') && trimmed.ends_with("\",") {
+                                Some(trimmed.trim_start_matches('"').trim_end_matches("\",").to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !v1_favorites.is_empty() {
+                        tracing::info!(
+                            "Migrating {} favorites from v1 to v2 config: {:?}",
+                            v1_favorites.len(),
+                            v1_favorites
+                        );
+                        config.favorites = v1_favorites;
+                        // Save to v2 config
+                        if let Some(ref handler) = config_handler {
+                            let _ = config.write_entry(handler);
+                        }
+                    }
+                }
+            }
+        }
 
         let mut app_list = Self {
             core,
@@ -823,9 +1107,20 @@ impl cosmic::Application for CosmicAppList {
         };
 
         app_list.update_desktop_entries();
+        tracing::debug!(
+            "init: loaded {} desktop entries",
+            app_list.desktop_entries.len()
+        );
         app_list.update_pinned_list();
 
         app_list.item_ctr = app_list.pinned_list.len() as u32;
+
+        tracing::debug!(
+            "init: output={}, item_ctr={}, pinned_list.len={}",
+            app_list.core.applet.output_name,
+            app_list.item_ctr,
+            app_list.pinned_list.len()
+        );
 
         (
             app_list,
@@ -1292,31 +1587,83 @@ impl cosmic::Application for CosmicAppList {
                     }
                     WaylandUpdate::Toplevel(event) => match event {
                         ToplevelUpdate::Add(mut info) => {
+                            tracing::debug!(
+                                "ToplevelUpdate::Add: app_id={}, title={:?}, ungrouped={}",
+                                info.app_id,
+                                info.title.chars().take(30).collect::<String>(),
+                                self.config.ungrouped_windows
+                            );
+                            // In ungrouped mode, filter by output - only show windows on this monitor
+                            if self.config.ungrouped_windows
+                                && !self.toplevel_on_current_output(&info)
+                            {
+                                tracing::debug!("  -> filtered out (not on current output)");
+                                return Task::none();
+                            }
+
                             let unicase_appid = fde::unicase::Ascii::new(&*info.app_id);
                             let new_desktop_info =
                                 self.find_desktop_entry_for_toplevel(&info, unicase_appid);
+                            tracing::debug!(
+                                "  -> desktop_info.id()={}, searching pinned_list",
+                                new_desktop_info.id()
+                            );
 
-                            if let Some(t) = self
-                                .active_list
-                                .iter_mut()
-                                .chain(self.pinned_list.iter_mut())
-                                .find(|DockItem { desktop_info, .. }| {
-                                    desktop_info.id() == new_desktop_info.id()
-                                })
-                            {
-                                t.toplevels.push((info, None));
-                            } else {
-                                if info.app_id.is_empty() {
-                                    info.app_id = format!("Unknown Application {}", self.item_ctr);
+                            if self.config.ungrouped_windows {
+                                // Ungrouped mode: each window gets its own DockItem
+                                // For pinned apps, add window to pinned_list entry
+                                // For non-pinned apps, add to active_list
+                                if let Some(t) = self.pinned_list.iter_mut().find(
+                                    |DockItem { desktop_info, .. }| {
+                                        desktop_info.id() == new_desktop_info.id()
+                                    },
+                                ) {
+                                    // Add to existing pinned app's toplevels
+                                    tracing::debug!("  -> matched pinned app: {}", t.original_app_id);
+                                    t.toplevels.push((info, None));
+                                } else {
+                                    // Create new active item for this window
+                                    tracing::debug!(
+                                        "  -> no pinned match, adding to active_list"
+                                    );
+                                    if info.app_id.is_empty() {
+                                        info.app_id =
+                                            format!("Unknown Application {}", self.item_ctr);
+                                    }
+                                    self.item_ctr += 1;
+
+                                    self.active_list.push(DockItem {
+                                        id: self.item_ctr,
+                                        original_app_id: info.app_id.clone(),
+                                        toplevels: vec![(info, None)],
+                                        desktop_info: new_desktop_info,
+                                    });
                                 }
-                                self.item_ctr += 1;
+                            } else {
+                                // Grouped mode: existing behavior
+                                if let Some(t) = self
+                                    .active_list
+                                    .iter_mut()
+                                    .chain(self.pinned_list.iter_mut())
+                                    .find(|DockItem { desktop_info, .. }| {
+                                        desktop_info.id() == new_desktop_info.id()
+                                    })
+                                {
+                                    t.toplevels.push((info, None));
+                                } else {
+                                    if info.app_id.is_empty() {
+                                        info.app_id =
+                                            format!("Unknown Application {}", self.item_ctr);
+                                    }
+                                    self.item_ctr += 1;
 
-                                self.active_list.push(DockItem {
-                                    id: self.item_ctr,
-                                    original_app_id: info.app_id.clone(),
-                                    toplevels: vec![(info, None)],
-                                    desktop_info: new_desktop_info,
-                                });
+                                    self.active_list.push(DockItem {
+                                        id: self.item_ctr,
+                                        original_app_id: info.app_id.clone(),
+                                        toplevels: vec![(info, None)],
+                                        desktop_info: new_desktop_info,
+                                    });
+                                }
                             }
                         }
                         ToplevelUpdate::Remove(handle) => {
@@ -1346,10 +1693,68 @@ impl cosmic::Application for CosmicAppList {
                             }
                         }
                         ToplevelUpdate::Update(info) => {
+                            tracing::debug!(
+                                "ToplevelUpdate::Update: app={}, title_len={}, title={:?}",
+                                info.app_id,
+                                info.title.chars().count(),
+                                info.title.chars().take(40).collect::<String>()
+                            );
                             // TODO probably want to make sure it is removed
                             if info.app_id.is_empty() {
                                 return Task::none();
                             }
+
+                            // In ungrouped mode, handle windows moving between outputs
+                            if self.config.ungrouped_windows {
+                                let is_on_current_output = self.toplevel_on_current_output(&info);
+                                let is_tracked = self
+                                    .active_list
+                                    .iter()
+                                    .chain(self.pinned_list.iter())
+                                    .any(|dock_item| {
+                                        dock_item.toplevels.iter().any(|(t_info, _)| {
+                                            t_info.foreign_toplevel == info.foreign_toplevel
+                                        })
+                                    });
+
+                                if is_tracked && !is_on_current_output {
+                                    // Window moved off this output, remove it
+                                    for t in self
+                                        .active_list
+                                        .iter_mut()
+                                        .chain(self.pinned_list.iter_mut())
+                                    {
+                                        t.toplevels.retain(|(t_info, _)| {
+                                            t_info.foreign_toplevel != info.foreign_toplevel
+                                        });
+                                    }
+                                    self.active_list.retain(|t| !t.toplevels.is_empty());
+                                    return Task::none();
+                                } else if !is_tracked && is_on_current_output {
+                                    // Window moved to this output, add it
+                                    let unicase_appid = fde::unicase::Ascii::new(&*info.app_id);
+                                    let new_desktop_info =
+                                        self.find_desktop_entry_for_toplevel(&info, unicase_appid);
+
+                                    if let Some(t) = self.pinned_list.iter_mut().find(
+                                        |DockItem { desktop_info, .. }| {
+                                            desktop_info.id() == new_desktop_info.id()
+                                        },
+                                    ) {
+                                        t.toplevels.push((info, None));
+                                    } else {
+                                        self.item_ctr += 1;
+                                        self.active_list.push(DockItem {
+                                            id: self.item_ctr,
+                                            original_app_id: info.app_id.clone(),
+                                            toplevels: vec![(info, None)],
+                                            desktop_info: new_desktop_info,
+                                        });
+                                    }
+                                    return Task::none();
+                                }
+                            }
+
                             let mut updated_appid = false;
 
                             'toplevel_loop: for toplevel_list in self
@@ -1671,6 +2076,20 @@ impl cosmic::Application for CosmicAppList {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        tracing::trace!(
+            "view: output={}, pinned_list.len={}, active_list.len={}, ungrouped={}",
+            self.core.applet.output_name,
+            self.pinned_list.len(),
+            self.active_list.len(),
+            self.config.ungrouped_windows
+        );
+        for item in &self.pinned_list {
+            tracing::trace!(
+                "  pinned: id={}, toplevels={}",
+                item.original_app_id,
+                item.toplevels.len()
+            );
+        }
         let focused_item = self.currently_active_toplevel();
         let theme = self.core.system_theme();
         let dot_radius = theme.cosmic().radius_xs();
@@ -1690,7 +2109,11 @@ impl cosmic::Application for CosmicAppList {
             }
         };
         let (favorite_popup_cutoff, active_popup_cutoff) = self.panel_overflow_lengths();
-        let mut favorite_to_remove = if let Some(cutoff) = favorite_popup_cutoff {
+        let mut favorite_to_remove = if self.config.ungrouped_windows {
+            // In ungrouped mode, always show all pinned apps as launchers
+            // (overflow calculation doesn't account for expanded window buttons)
+            0
+        } else if let Some(cutoff) = favorite_popup_cutoff {
             if cutoff < self.pinned_list.len() {
                 self.pinned_list.len() - cutoff + 1
             } else {
@@ -1699,12 +2122,20 @@ impl cosmic::Application for CosmicAppList {
         } else {
             0
         };
+        tracing::debug!(
+            "view: pinned_list.len()={}, favorite_to_remove={}, ungrouped={}",
+            self.pinned_list.len(),
+            favorite_to_remove,
+            self.config.ungrouped_windows
+        );
         let favorites: Vec<_> = self
             .pinned_list
             .iter()
             .rev()
             .filter(|f| {
-                if favorite_to_remove > 0 && f.toplevels.is_empty() {
+                // When overflow is needed, hide pinned apps WITH windows first
+                // (they're already visible as running apps), keep empty pinned apps visible
+                if favorite_to_remove > 0 && !f.toplevels.is_empty() {
                     favorite_to_remove -= 1;
                     false
                 } else {
@@ -1712,38 +2143,110 @@ impl cosmic::Application for CosmicAppList {
                 }
             })
             .collect();
-        let mut favorites: Vec<_> = favorites[favorite_to_remove..]
-            .iter()
-            .rev()
-            .map(|dock_item| {
-                self.core
-                    .applet
-                    .applet_tooltip::<Message>(
-                        dock_item.as_icon(
-                            &self.core.applet,
-                            self.rectangle_tracker.as_ref(),
-                            self.popup.is_none(),
-                            self.config.enable_drag_source,
-                            self.gpus.as_deref(),
-                            dock_item
-                                .toplevels
-                                .iter()
-                                .any(|y| focused_item.contains(&y.0.foreign_toplevel)),
-                            dot_radius,
-                            self.core.main_window_id().unwrap(),
-                        ),
+        tracing::debug!(
+            "view: after filter favorites.len()={}, remaining favorite_to_remove={}",
+            favorites.len(),
+            favorite_to_remove
+        );
+        let mut favorites: Vec<_> = if self.config.ungrouped_windows {
+            // Ungrouped mode: show each window separately, or app icon if no windows
+            favorites
+                .iter()
+                .rev()
+                .flat_map(|dock_item| {
+                    if dock_item.toplevels.is_empty() {
+                        // No windows: show app icon for launching
+                        vec![self
+                            .core
+                            .applet
+                            .applet_tooltip::<Message>(
+                                dock_item.as_icon(
+                                    &self.core.applet,
+                                    self.rectangle_tracker.as_ref(),
+                                    self.popup.is_none(),
+                                    self.config.enable_drag_source,
+                                    self.gpus.as_deref(),
+                                    false,
+                                    dot_radius,
+                                    self.core.main_window_id().unwrap(),
+                                ),
+                                dock_item
+                                    .desktop_info
+                                    .full_name(&self.locales)
+                                    .unwrap_or_default()
+                                    .into_owned(),
+                                self.popup.is_some(),
+                                Message::Surface,
+                                None,
+                            )
+                            .into()]
+                    } else {
+                        // Has windows: show each window with title
                         dock_item
-                            .desktop_info
-                            .full_name(&self.locales)
-                            .unwrap_or_default()
-                            .into_owned(),
-                        self.popup.is_some(),
-                        Message::Surface,
-                        None,
-                    )
-                    .into()
-            })
-            .collect();
+                            .toplevels
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, (toplevel_info, _))| {
+                                let is_focused =
+                                    focused_item.contains(&toplevel_info.foreign_toplevel);
+                                self.core
+                                    .applet
+                                    .applet_tooltip::<Message>(
+                                        dock_item.as_ungrouped_window(
+                                            &self.core.applet,
+                                            self.rectangle_tracker.as_ref(),
+                                            idx,
+                                            is_focused,
+                                            dot_radius,
+                                            self.core.main_window_id().unwrap(),
+                                        ),
+                                        toplevel_info.title.clone(),
+                                        self.popup.is_some(),
+                                        Message::Surface,
+                                        None,
+                                    )
+                                    .into()
+                            })
+                            .collect()
+                    }
+                })
+                .collect()
+        } else {
+            // Grouped mode: existing behavior
+            // Note: favorites is already filtered, so iterate over all remaining items
+            favorites
+                .iter()
+                .rev()
+                .map(|dock_item| {
+                    self.core
+                        .applet
+                        .applet_tooltip::<Message>(
+                            dock_item.as_icon(
+                                &self.core.applet,
+                                self.rectangle_tracker.as_ref(),
+                                self.popup.is_none(),
+                                self.config.enable_drag_source,
+                                self.gpus.as_deref(),
+                                dock_item
+                                    .toplevels
+                                    .iter()
+                                    .any(|y| focused_item.contains(&y.0.foreign_toplevel)),
+                                dot_radius,
+                                self.core.main_window_id().unwrap(),
+                            ),
+                            dock_item
+                                .desktop_info
+                                .full_name(&self.locales)
+                                .unwrap_or_default()
+                                .into_owned(),
+                            self.popup.is_some(),
+                            Message::Surface,
+                            None,
+                        )
+                        .into()
+                })
+                .collect()
+        };
 
         if favorite_popup_cutoff.is_some() {
             // button to show more favorites
@@ -1800,14 +2303,49 @@ impl cosmic::Application for CosmicAppList {
             );
         }
 
-        let mut active: Vec<_> =
-            self.active_list[..active_popup_cutoff.map_or(self.active_list.len(), |n| {
-                if n < self.active_list.len() {
-                    n.saturating_sub(1)
-                } else {
-                    n
-                }
-            })]
+        let active_slice_end = active_popup_cutoff.map_or(self.active_list.len(), |n| {
+            if n < self.active_list.len() {
+                n.saturating_sub(1)
+            } else {
+                n
+            }
+        });
+
+        let mut active: Vec<_> = if self.config.ungrouped_windows {
+            // Ungrouped mode: each DockItem has one toplevel, render with title
+            self.active_list[..active_slice_end]
+                .iter()
+                .flat_map(|dock_item| {
+                    dock_item
+                        .toplevels
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, (toplevel_info, _))| {
+                            let is_focused = focused_item.contains(&toplevel_info.foreign_toplevel);
+                            self.core
+                                .applet
+                                .applet_tooltip(
+                                    dock_item.as_ungrouped_window(
+                                        &self.core.applet,
+                                        self.rectangle_tracker.as_ref(),
+                                        idx,
+                                        is_focused,
+                                        dot_radius,
+                                        self.core.main_window_id().unwrap(),
+                                    ),
+                                    toplevel_info.title.clone(),
+                                    self.popup.is_some(),
+                                    Message::Surface,
+                                    None,
+                                )
+                                .into()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        } else {
+            // Grouped mode: existing behavior
+            self.active_list[..active_slice_end]
                 .iter()
                 .map(|dock_item| {
                     self.core
@@ -1837,7 +2375,8 @@ impl cosmic::Application for CosmicAppList {
                         )
                         .into()
                 })
-                .collect();
+                .collect()
+        };
 
         if active_popup_cutoff.is_some_and(|n| n < self.active_list.len()) {
             // button to show more active
@@ -1921,6 +2460,12 @@ impl cosmic::Application for CosmicAppList {
 
         let show_pinned =
             !self.pinned_list.is_empty() || self.dnd_offer.is_some() || self.is_listening_for_dnd;
+        tracing::debug!(
+            "view: show_pinned={}, pinned_list.len()={}, active_list.len()={}",
+            show_pinned,
+            self.pinned_list.len(),
+            self.active_list.len()
+        );
         let content_list: Vec<Element<_>> = if show_pinned && !self.active_list.is_empty() {
             vec![favorites.into(), divider, active]
         } else if show_pinned {
@@ -2308,7 +2853,9 @@ impl cosmic::Application for CosmicAppList {
                 .iter()
                 .rev()
                 .filter(|f| {
-                    if favorite_to_remove > 0 && f.toplevels.is_empty() {
+                    // When overflow is needed, show pinned apps WITH windows in overflow
+                    // (they're already visible as running apps), keep empty pinned apps on main dock
+                    if favorite_to_remove > 0 && !f.toplevels.is_empty() {
                         favorite_to_remove -= 1;
                         true
                     } else {
